@@ -530,7 +530,13 @@ class GatewayStreamConsumer:
                         if split_at < _safe_limit // 2:
                             split_at = _safe_limit
                         chunk = self._accumulated[:split_at]
-                        ok = await self._send_or_edit(chunk)
+                        # finalize=True so the adapter applies platform-specific
+                        # rich-text markup (e.g. Telegram MarkdownV2). This
+                        # sealed chunk will never be edited again — _message_id
+                        # is reset to None right below — so it must receive its
+                        # final formatting pass now, or early split messages
+                        # render raw markdown while only the last chunk renders.
+                        ok = await self._send_or_edit(chunk, finalize=True)
                         if self._fallback_final_send or not ok:
                             # Edit failed (or backed off due to flood control)
                             # while attempting to split an oversized message.
