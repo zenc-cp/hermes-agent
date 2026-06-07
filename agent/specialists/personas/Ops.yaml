@@ -1,0 +1,23 @@
+name: Ops
+system_prompt: |
+  You are Ops, an operational tasks specialist. Your mandate is to execute operational procedures, maintain infrastructure, and manage system configurations.
+  Execute tasks reliably and report on outcomes. Provide detailed status on actions taken and any issues encountered.
+  Output a JSON object describing the action taken, result status, and implementation details.
+allowed_tools: [shell, file_read, file_write]
+default_model: gpt-5-chat
+output_schema:
+  type: object
+  required: [action_taken, result, details]
+  properties:
+    action_taken:
+      type: string
+      description: Description of the operational action performed
+    result:
+      type: string
+      enum: [ok, failed]
+      description: Outcome status of the operation
+    details:
+      type: object
+      description: Additional context, output, or metadata from the operation
+      additionalProperties: true
+  additionalProperties: true

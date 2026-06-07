@@ -2,9 +2,80 @@ import { describe, expect, it } from 'vitest'
 
 import type { HermesConfigRecord } from '@/types/hermes'
 
-import { getNested, providerGroup, setNested } from './helpers'
+import { defineFieldCopy, fieldCopyForSchemaKey, schemaKeyToFieldCopyKey } from './field-copy'
+import { getNested, providerGroup, setNested, stripToolsetLabel, toolsetDisplayLabel } from './helpers'
 
 describe('settings helpers', () => {
+  describe('defineFieldCopy', () => {
+    it('flattens nested field copy paths', () => {
+      const copy = defineFieldCopy({
+        display: {
+          personality: 'Personality'
+        },
+        stt: {
+          elevenlabs: {
+            language_code: 'Language'
+          }
+        }
+      })
+
+      expect(copy[['display', 'personality'].join('.')]).toBe('Personality')
+      expect(copy[['stt', 'elevenlabs', 'language_code'].join('.')]).toBe('Language')
+    })
+
+    it('keeps top-level flat field keys', () => {
+      expect(
+        defineFieldCopy({
+          model_context_length: 'Context Window',
+          file_read_max_chars: 'File Read Limit'
+        })
+      ).toEqual({
+        model_context_length: 'Context Window',
+        file_read_max_chars: 'File Read Limit'
+      })
+    })
+
+    it('maps schema keys to camelCase translation keys', () => {
+      expect(schemaKeyToFieldCopyKey('model_context_length')).toBe('modelContextLength')
+      expect(schemaKeyToFieldCopyKey('display.show_reasoning')).toBe('display.showReasoning')
+      expect(schemaKeyToFieldCopyKey('tool_output.max_line_length')).toBe('toolOutput.maxLineLength')
+      expect(schemaKeyToFieldCopyKey('updates.non_interactive_local_changes')).toBe(
+        'updates.nonInteractiveLocalChanges'
+      )
+    })
+
+    it('looks up camelCase field copy by schema key with legacy fallback', () => {
+      const copy = defineFieldCopy({
+        display: {
+          showReasoning: 'Reasoning Blocks'
+        },
+        file_read_max_chars: 'Legacy File Read Limit',
+        modelContextLength: 'Context Window',
+        toolOutput: {
+          maxLineLength: 'Line Length Limit'
+        }
+      })
+
+      expect(fieldCopyForSchemaKey(copy, 'model_context_length')).toBe('Context Window')
+      expect(fieldCopyForSchemaKey(copy, 'display.show_reasoning')).toBe('Reasoning Blocks')
+      expect(fieldCopyForSchemaKey(copy, 'tool_output.max_line_length')).toBe('Line Length Limit')
+      expect(fieldCopyForSchemaKey(copy, 'file_read_max_chars')).toBe('Legacy File Read Limit')
+    })
+
+    it('rejects duplicate flattened paths', () => {
+      const duplicateKey = ['display', 'personality'].join('.')
+
+      expect(() =>
+        defineFieldCopy({
+          display: {
+            personality: 'Personality'
+          },
+          [duplicateKey]: 'Duplicate'
+        })
+      ).toThrow('Duplicate field copy key: display.personality')
+    })
+  })
+
   it('reads and writes nested config paths', () => {
     const config: HermesConfigRecord = { display: { theme: 'mono' } }
     const next = setNested(config, 'display.theme', 'slate')
@@ -19,6 +90,26 @@ describe('settings helpers', () => {
     expect(() => setNested(config, '__proto__.polluted', true)).toThrow('Unsafe config path')
     expect(() => setNested(config, 'constructor.prototype.polluted', true)).toThrow('Unsafe config path')
     expect(({} as Record<string, unknown>).polluted).toBeUndefined()
+  })
+
+  describe('stripToolsetLabel', () => {
+    it('removes leading emoji prefixes from registry labels', () => {
+      expect(stripToolsetLabel('⏰ Cron Jobs')).toBe('Cron Jobs')
+      expect(stripToolsetLabel('⚡ Code Execution')).toBe('Code Execution')
+      expect(stripToolsetLabel('❓ Clarifying Questions')).toBe('Clarifying Questions')
+      expect(stripToolsetLabel('🌐 Browser Automation')).toBe('Browser Automation')
+      expect(stripToolsetLabel('🎨 Image Generation')).toBe('Image Generation')
+    })
+
+    it('leaves plain titles unchanged', () => {
+      expect(stripToolsetLabel('Terminal & Processes')).toBe('Terminal & Processes')
+    })
+  })
+
+  describe('toolsetDisplayLabel', () => {
+    it('strips emoji from toolset rows', () => {
+      expect(toolsetDisplayLabel({ name: 'cronjob', label: '⏰ Cron Jobs' })).toBe('Cron Jobs')
+    })
   })
 
   describe('providerGroup', () => {
