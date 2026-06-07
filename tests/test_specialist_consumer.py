@@ -1,0 +1,128 @@
+"""
+ADR-025 implementation tests 3–6: brain-inbox consumer behaviours.
+
+RED-FIRST: these fail until agent/specialists/consumer.py exists.
+"""
+from __future__ import annotations
+
+import json
+from pathlib import Path
+from unittest.mock import patch
+
+import pytest
+
+
+def _write_dispatch(inbox: Path, task_id: str, specialist: str) -> Path:
+    f = inbox / f"{task_id}.json"
+    f.write_text(
+        json.dumps(
+            {
+                "task_id": task_id,
+                "specialist": specialist,
+                "task": {"query": "test"},
+                "context": {},
+                "enqueued_at": "2026-06-07T15:00:00Z",
+            }
+        ),
+        encoding="utf-8",
+    )
+    return f
+
+
+def _make_persona_dir(d: Path) -> Path:
+    """Drop a minimal Scout.yaml so the loader has something to find."""
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "Scout.yaml").write_text(
+        "name: Scout\n"
+        "system_prompt: stub\n"
+        "allowed_tools: []\n"
+        "default_model: gpt-5-chat\n"
+        "output_schema: {type: object}\n",
+        encoding="utf-8",
+    )
+    return d
+
+
+def test_consumer_drains_one_file_then_exits_with_once_flag(tmp_path: Path) -> None:
+    """Test 3 — --once drains exactly one dispatch then exits."""
+    from agent.specialists.consumer import run_once
+
+    inbox = tmp_path / "brain-inbox"
+    results = tmp_path / "results"
+    personas = _make_persona_dir(tmp_path / "personas")
+    inbox.mkdir()
+    results.mkdir()
+    f = _write_dispatch(inbox, "task-1", "Scout")
+
+    with patch("agent.specialists.consumer.invoke_agent", return_value={"findings": []}), \
+         patch("agent.specialists.consumer.record_event"):
+        run_once(inbox_dir=inbox, results_dir=results, persona_dir=personas)
+
+    assert not f.exists(), "dispatch file should be drained from inbox"
+
+
+def test_consumer_writes_status_file_atomically(tmp_path: Path) -> None:
+    """Test 4 — status file write uses os.replace (atomic rename)."""
+    from agent.specialists import consumer
+    from agent.specialists.consumer import run_once
+
+    inbox = tmp_path / "brain-inbox"
+    results = tmp_path / "results"
+    personas = _make_persona_dir(tmp_path / "personas")
+    inbox.mkdir()
+    results.mkdir()
+    _write_dispatch(inbox, "task-2", "Scout")
+
+    with patch("agent.specialists.consumer.invoke_agent", return_value={"findings": []}), \
+         patch("agent.specialists.consumer.record_event"), \
+         patch.object(consumer.os, "replace", wraps=consumer.os.replace) as mock_replace:
+        run_once(inbox_dir=inbox, results_dir=results, persona_dir=personas)
+
+    assert mock_replace.called, "consumer must use os.replace for atomic status file write"
+
+
+def test_consumer_records_dispatch_completed_event(tmp_path: Path) -> None:
+    """Test 5 — successful dispatch produces exactly one dispatch_completed event."""
+    from agent.specialists.consumer import run_once
+
+    inbox = tmp_path / "brain-inbox"
+    results = tmp_path / "results"
+    personas = _make_persona_dir(tmp_path / "personas")
+    inbox.mkdir()
+    results.mkdir()
+    _write_dispatch(inbox, "task-3", "Scout")
+
+    with patch("agent.specialists.consumer.invoke_agent", return_value={"findings": []}), \
+         patch("agent.specialists.consumer.record_event") as mock_record:
+        run_once(inbox_dir=inbox, results_dir=results, persona_dir=personas)
+
+    assert mock_record.call_count == 1
+    call_kwargs = mock_record.call_args.kwargs or {}
+    call_args = mock_record.call_args.args
+    payload = call_args[0] if call_args else call_kwargs
+    serialized = json.dumps(payload, default=str)
+    assert "dispatch_completed" in serialized
+    assert "task-3" in serialized
+    assert "Scout" in serialized
+
+
+def test_consumer_handles_persona_load_failure_gracefully(tmp_path: Path) -> None:
+    """Test 6 — unknown specialist writes a failed status file, no crash."""
+    from agent.specialists.consumer import run_once
+
+    inbox = tmp_path / "brain-inbox"
+    results = tmp_path / "results"
+    personas = _make_persona_dir(tmp_path / "personas")  # only Scout exists
+    inbox.mkdir()
+    results.mkdir()
+    _write_dispatch(inbox, "task-4", "Ghost")  # Ghost has no YAML
+
+    with patch("agent.specialists.consumer.invoke_agent"), \
+         patch("agent.specialists.consumer.record_event"):
+        run_once(inbox_dir=inbox, results_dir=results, persona_dir=personas)
+
+    status_file = results / "task-4.json"
+    assert status_file.exists(), "failed dispatch must still write a status file"
+    body = json.loads(status_file.read_text(encoding="utf-8"))
+    assert body["status"] == "failed"
+    assert "Ghost" in body.get("error", "") or "unknown" in body.get("error", "").lower()
