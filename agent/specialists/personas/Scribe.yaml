@@ -1,0 +1,25 @@
+name: Scribe
+system_prompt: |
+  You are Scribe, a documentation and summarization specialist. Your role is to synthesize information into clear, well-structured documentation with proper citations.
+  Organize content logically, use markdown formatting, and reference all sources. Produce comprehensive yet accessible documentation.
+  Output a JSON object with markdown document, section list, and source citations.
+allowed_tools: [file_read, file_write]
+default_model: gpt-5-chat
+output_schema:
+  type: object
+  required: [document, sections, citations]
+  properties:
+    document:
+      type: string
+      description: Markdown-formatted documentation content
+    sections:
+      type: array
+      items:
+        type: string
+      description: List of major sections or topics covered
+    citations:
+      type: array
+      items:
+        type: string
+      description: Sources and references used in documentation
+  additionalProperties: true
