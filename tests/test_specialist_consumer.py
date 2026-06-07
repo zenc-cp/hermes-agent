@@ -126,3 +126,116 @@ def test_consumer_handles_persona_load_failure_gracefully(tmp_path: Path) -> Non
     body = json.loads(status_file.read_text(encoding="utf-8"))
     assert body["status"] == "failed"
     assert "Ghost" in body.get("error", "") or "unknown" in body.get("error", "").lower()
+
+
+# ---------------------------------------------------------------------------
+# New reliability tests (fixes 1-5)
+# ---------------------------------------------------------------------------
+
+def test_consumer_handles_malformed_json(tmp_path: Path) -> None:
+    """Fix 1 — malformed JSON must write a failed status file and delete inbox."""
+    from agent.specialists.consumer import run_once
+
+    inbox = tmp_path / "brain-inbox"
+    results = tmp_path / "results"
+    personas = _make_persona_dir(tmp_path / "personas")
+    inbox.mkdir()
+    results.mkdir()
+
+    bad_file = inbox / "bad-task.json"
+    bad_file.write_text("{not json", encoding="utf-8")
+
+    with patch("agent.specialists.consumer.record_event"):
+        run_once(inbox_dir=inbox, results_dir=results, persona_dir=personas)
+
+    assert not bad_file.exists(), "inbox file must be deleted even on malformed JSON"
+    status_file = results / "bad-task.json"
+    assert status_file.exists(), "failed status file must be written for malformed JSON"
+    body = json.loads(status_file.read_text(encoding="utf-8"))
+    assert body["status"] == "failed"
+    assert "malformed" in body["error"]
+
+
+def test_consumer_continues_when_invoke_agent_raises(tmp_path: Path) -> None:
+    """Fix 2 — invoke_agent exception must write failed status and delete inbox."""
+    from agent.specialists.consumer import run_once
+
+    inbox = tmp_path / "brain-inbox"
+    results = tmp_path / "results"
+    personas = _make_persona_dir(tmp_path / "personas")
+    inbox.mkdir()
+    results.mkdir()
+    f = _write_dispatch(inbox, "task-inv", "Scout")
+
+    with patch("agent.specialists.consumer.invoke_agent", side_effect=RuntimeError("boom")), \
+         patch("agent.specialists.consumer.record_event") as mock_record:
+        run_once(inbox_dir=inbox, results_dir=results, persona_dir=personas)
+
+    assert not f.exists(), "inbox file must be deleted when invoke_agent raises"
+    status_file = results / "task-inv.json"
+    assert status_file.exists()
+    body = json.loads(status_file.read_text(encoding="utf-8"))
+    assert body["status"] == "failed"
+    assert "boom" in body["error"]
+    assert mock_record.called, "record_event must still be called on invoke_agent failure"
+
+
+def test_consumer_continues_when_record_event_raises(tmp_path: Path) -> None:
+    """Fix 3 — record_event failure must not propagate or block inbox deletion."""
+    from agent.specialists.consumer import run_once
+
+    inbox = tmp_path / "brain-inbox"
+    results = tmp_path / "results"
+    personas = _make_persona_dir(tmp_path / "personas")
+    inbox.mkdir()
+    results.mkdir()
+    f = _write_dispatch(inbox, "task-rec", "Scout")
+
+    with patch("agent.specialists.consumer.invoke_agent", return_value={"findings": []}), \
+         patch("agent.specialists.consumer.record_event", side_effect=RuntimeError("db down")):
+        # Must not raise
+        run_once(inbox_dir=inbox, results_dir=results, persona_dir=personas)
+
+    assert not f.exists(), "inbox file must be deleted even when record_event raises"
+    assert (results / "task-rec.json").exists(), "status file must be written before record_event"
+
+
+def test_consumer_creates_results_dir_when_missing(tmp_path: Path) -> None:
+    """Fix 4 — results_dir is created automatically if it doesn't exist."""
+    from agent.specialists.consumer import run_once
+
+    inbox = tmp_path / "brain-inbox"
+    results = tmp_path / "results" / "nested" / "dir"  # does not exist yet
+    personas = _make_persona_dir(tmp_path / "personas")
+    inbox.mkdir()
+    _write_dispatch(inbox, "task-mkdir", "Scout")
+
+    with patch("agent.specialists.consumer.invoke_agent", return_value={"findings": []}), \
+         patch("agent.specialists.consumer.record_event"):
+        run_once(inbox_dir=inbox, results_dir=results, persona_dir=personas)
+
+    assert results.is_dir(), "results_dir must be created automatically"
+    assert (results / "task-mkdir.json").exists()
+
+
+def test_consumer_returns_quietly_when_file_vanishes_between_glob_and_read(tmp_path: Path) -> None:
+    """Fix 5 — TOCTOU: file disappears between glob and read must not raise."""
+    from agent.specialists.consumer import run_once
+
+    inbox = tmp_path / "brain-inbox"
+    results = tmp_path / "results"
+    personas = _make_persona_dir(tmp_path / "personas")
+    inbox.mkdir()
+    results.mkdir()
+    _write_dispatch(inbox, "task-toctou", "Scout")
+
+    original_read_text = Path.read_text
+
+    def vanish_on_inbox(self: Path, *args, **kwargs):
+        if self.parent.resolve() == inbox.resolve():
+            raise FileNotFoundError(f"simulated race: {self}")
+        return original_read_text(self, *args, **kwargs)
+
+    with patch.object(Path, "read_text", vanish_on_inbox):
+        # Must return without raising
+        run_once(inbox_dir=inbox, results_dir=results, persona_dir=personas)
