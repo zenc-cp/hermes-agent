@@ -183,3 +183,33 @@ def _write_status_atomic(results_dir: Path, task_id: str, payload: dict) -> None
     tmp_path = results_dir / f"{task_id}.tmp"
     tmp_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     os.replace(tmp_path, results_dir / f"{task_id}.json")
+
+
+def _main_loop(poll_interval_sec: float = 2.0) -> None:
+    """Production main loop. Polls brain-inbox forever, drains one file per tick.
+
+    Reads paths from env: BRAIN_INBOX_PATH, RESULTS_PATH, HERMES_PERSONA_DIR.
+    Defaults are the deployed VM paths.
+    """
+    import time
+    inbox = Path(os.getenv("BRAIN_INBOX_PATH", "/var/lib/design-e/brain-inbox"))
+    results = Path(os.getenv("RESULTS_PATH", "/var/lib/design-e/results"))
+    personas = Path(
+        os.getenv("HERMES_PERSONA_DIR", str(Path.home() / ".hermes" / "specialists"))
+    )
+    print(
+        f"zenops-consumer starting: inbox={inbox} results={results} personas={personas}",
+        file=sys.stderr,
+        flush=True,
+    )
+    while True:
+        try:
+            run_once(inbox, results, personas)
+        except Exception as exc:  # noqa: BLE001  defensive: loop must never die
+            print(f"zenops-consumer run_once unexpected error: {exc!r}", file=sys.stderr, flush=True)
+        time.sleep(poll_interval_sec)
+
+
+if __name__ == "__main__":
+    start()  # raises ConsumerDisabledError if ZENOPS_CONSUMER_ENABLED != "true"
+    _main_loop()
