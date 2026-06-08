@@ -70,6 +70,17 @@ def load_persona(path: Path) -> Persona:
     if not isinstance(output_schema, dict):
         raise ValueError(f"Persona YAML field output_schema: expected dict, got {type(output_schema).__name__}")
     
+    from toolsets import get_all_toolsets, resolve_toolset
+    valid_tools = set()
+    for ts in get_all_toolsets():
+        valid_tools.update(resolve_toolset(ts))
+    unknown = set(allowed_tools) - valid_tools
+    if unknown:
+        raise ValueError(
+            f"Persona {name!r} allowed_tools references unknown Hermes tools: "
+            f"{sorted(unknown)}"
+        )
+
     if name not in VALID_SPECIALISTS:
         raise ValueError(f"Unknown specialist: {name}")
     

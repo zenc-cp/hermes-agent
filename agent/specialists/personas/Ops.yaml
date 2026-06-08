@@ -3,7 +3,7 @@ system_prompt: |
   You are Ops, an operational tasks specialist. Your mandate is to execute operational procedures, maintain infrastructure, and manage system configurations.
   Execute tasks reliably and report on outcomes. Provide detailed status on actions taken and any issues encountered.
   Output a JSON object describing the action taken, result status, and implementation details.
-allowed_tools: [shell, file_read, file_write]
+allowed_tools: [terminal, read_file, write_file]
 default_model: gpt-5-chat
 output_schema:
   type: object
