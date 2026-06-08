@@ -332,3 +332,172 @@ def test_main_loop_survives_run_once_exception(monkeypatch, tmp_path: Path, caps
     captured = capsys.readouterr()
     assert "boom" in captured.err, "_main_loop should log run_once exceptions to stderr"
 
+
+# ---------------------------------------------------------------------------
+# New invoke_agent tests (AC1-AC6)
+# ---------------------------------------------------------------------------
+
+
+def test_invoke_agent_happy_path(monkeypatch) -> None:
+    """AC1+AC2: invoke_agent calls AIAgent, extracts JSON, validates schema."""
+    from agent.specialists.consumer import invoke_agent
+    from agent.specialists.persona import Persona
+
+    persona = Persona(
+        name="Scout",
+        system_prompt="You are Scout.",
+        allowed_tools=["web_search"],
+        default_model="gpt-5-chat",
+        output_schema={"type": "object", "properties": {"findings": {"type": "array"}}},
+    )
+
+    # Mock AIAgent.chat to return a valid JSON response
+    mock_chat_response = '{"findings": ["result1", "result2"]}'
+
+    mock_agent = type("MockAgent", (), {"chat": lambda self, prompt: mock_chat_response})()
+
+    def mock_agent_init(*args, **kwargs):
+        return mock_agent
+
+    monkeypatch.setattr("run_agent.AIAgent", mock_agent_init)
+
+    result = invoke_agent(persona, "What is X?", {})
+    assert result == {"findings": ["result1", "result2"]}
+
+
+def test_invoke_agent_schema_violation(monkeypatch) -> None:
+    """AC2: output violating schema raises ValueError."""
+    from agent.specialists.consumer import invoke_agent
+    from agent.specialists.persona import Persona
+
+    persona = Persona(
+        name="Scout",
+        system_prompt="You are Scout.",
+        allowed_tools=["web_search"],
+        default_model="gpt-5-chat",
+        output_schema={
+            "type": "object",
+            "required": ["findings"],
+            "properties": {"findings": {"type": "array"}},
+        },
+    )
+
+    # Response missing the required "findings" key
+    mock_chat_response = '{"wrong_key": "value"}'
+
+    mock_agent = type("MockAgent", (), {"chat": lambda self, prompt: mock_chat_response})()
+
+    def mock_agent_init(*args, **kwargs):
+        return mock_agent
+
+    monkeypatch.setattr("run_agent.AIAgent", mock_agent_init)
+
+    with pytest.raises(ValueError, match="output_schema violation"):
+        invoke_agent(persona, "What is X?", {})
+
+
+@pytest.mark.parametrize("raw", [
+    "Sure! Here is the answer:\n```json\n{\"a\": 1}\n```",
+    "Reasoning: foo bar.\n\n{\"a\": 1}\n\nDone.",
+    "{\"a\": 1}\n\nLet me know if you need more.",
+])
+def test_invoke_agent_non_json_recovery(raw, monkeypatch) -> None:
+    """AC1: models often write prose before/after JSON; _extract_json recovers."""
+    from agent.specialists.consumer import invoke_agent
+    from agent.specialists.persona import Persona
+
+    persona = Persona(
+        name="Scout",
+        system_prompt="You are Scout.",
+        allowed_tools=["web_search"],
+        default_model="gpt-5-chat",
+        output_schema={"type": "object", "properties": {"a": {"type": "number"}}},
+    )
+
+    mock_agent = type("MockAgent", (), {"chat": lambda self, prompt: raw})()
+
+    def mock_agent_init(*args, **kwargs):
+        return mock_agent
+
+    monkeypatch.setattr("run_agent.AIAgent", mock_agent_init)
+
+    result = invoke_agent(persona, "What is X?", {})
+    assert result == {"a": 1}
+
+
+@pytest.mark.parametrize("name", ["Scout", "Hunter", "Sentinel", "Trader", "Scribe", "Ops"])
+def test_toolsets_mapping_all_personas(name) -> None:
+    """AC4+AC6: all 6 personas map cleanly to toolsets via _TOOL_TO_TOOLSET."""
+    from agent.specialists.persona import load_persona
+    from pathlib import Path
+    from tempfile import TemporaryDirectory
+
+    with TemporaryDirectory() as tmpdir:
+        personas_dir = Path(tmpdir)
+        persona_yaml = personas_dir / f"{name}.yaml"
+
+        # Load each persona from the actual repo and verify tools are mapped
+        import importlib.resources
+        from agent.specialists import personas
+
+        try:
+            if hasattr(importlib.resources, "files"):
+                # Python 3.9+
+                package_path = importlib.resources.files(personas)
+                yaml_data = (package_path / f"{name}.yaml").read_text()
+            else:
+                # Fallback for older Python
+                import pkg_resources
+                yaml_data = pkg_resources.resource_string("agent.specialists.personas", f"{name}.yaml").decode()
+        except Exception:
+            pytest.skip(f"Could not load {name}.yaml from package")
+
+        persona_yaml.write_text(yaml_data, encoding="utf-8")
+        persona = load_persona(persona_yaml)
+
+        # Verify all tools are in _TOOL_TO_TOOLSET
+        from agent.specialists.consumer import _TOOL_TO_TOOLSET, _toolsets_for
+
+        for tool in persona.allowed_tools:
+            assert tool in _TOOL_TO_TOOLSET, f"Persona {name} tool {tool!r} not in _TOOL_TO_TOOLSET"
+
+        # Should not raise
+        toolsets = _toolsets_for(persona)
+        assert isinstance(toolsets, list)
+        assert len(toolsets) > 0
+
+
+def test_persona_validator_rejects_unknown_tool(tmp_path: Path) -> None:
+    """AC6: load_persona validator rejects unknown Hermes tool names."""
+    from agent.specialists.persona import load_persona
+
+    bad_yaml = tmp_path / "BadPersona.yaml"
+    bad_yaml.write_text(
+        "name: BadPersona\n"
+        "system_prompt: stub\n"
+        "allowed_tools: [web_search, fake_tool_that_does_not_exist]\n"
+        "default_model: gpt-5-chat\n"
+        "output_schema: {type: object}\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="unknown Hermes tools"):
+        load_persona(bad_yaml)
+
+
+def test_main_startup_disabled_no_heavy_import(monkeypatch):
+    """AC5: importing consumer must NOT pull run_agent (lazy-import regression test)."""
+    import importlib
+    import sys
+
+    # Clear any cached modules
+    for k in list(sys.modules):
+        if k.startswith("run_agent") or k.startswith("agent.specialists.consumer"):
+            sys.modules.pop(k)
+
+    monkeypatch.delenv("ZENOPS_CONSUMER_ENABLED", raising=False)
+
+    # This import must NOT trigger run_agent import
+    import agent.specialists.consumer  # noqa: F401
+
+    assert "run_agent" not in sys.modules, "lazy-import regression: run_agent leaked into sys.modules"

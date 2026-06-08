@@ -14,8 +14,100 @@ class ConsumerDisabledError(RuntimeError):
     """Raised when ZENOPS_CONSUMER_ENABLED != 'true'."""
 
 
+# Map persona tool names → toolset names that AIAgent.enabled_toolsets accepts.
+# Verified against toolsets.py:TOOLSETS (2026-06-08).
+_TOOL_TO_TOOLSET = {
+    "web_search":   "web",
+    "web_extract":  "web",
+    "terminal":     "terminal",
+    "read_file":    "file",
+    "write_file":   "file",
+}
+
+# VM loopback inference shim — no auth, OpenAI-compatible.
+_HERMES_BASE_URL = "http://127.0.0.1:8403/v1"
+
+
+def _toolsets_for(persona) -> list[str]:
+    out = set()
+    for tool in persona.allowed_tools:
+        if tool not in _TOOL_TO_TOOLSET:
+            raise ValueError(
+                f"persona {persona.name!r} requested tool {tool!r} not in "
+                f"_TOOL_TO_TOOLSET; update the table"
+            )
+        out.add(_TOOL_TO_TOOLSET[tool])
+    return sorted(out)
+
+
+def _render_prompt(task: str, context: dict, schema: dict) -> str:
+    import json
+    return (
+        f"TASK:\n{task}\n\n"
+        f"CONTEXT:\n{json.dumps(context, indent=2)}\n\n"
+        f"OUTPUT FORMAT — return ONLY a JSON object matching this schema:\n"
+        f"{json.dumps(schema, indent=2)}\n\n"
+        f"No prose. No markdown fences. Just the JSON object."
+    )
+
+
+def _extract_json(raw: str) -> dict:
+    """Find the LAST balanced {...} block — models often write prose then JSON."""
+    import json
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        pass
+    s = raw.strip()
+    if s.startswith("```"):
+        parts = s.split("```")
+        if len(parts) >= 3:
+            s = parts[1]
+            if s.startswith("json"):
+                s = s[4:]
+    last_close = s.rfind("}")
+    if last_close == -1:
+        raise ValueError(f"no JSON object in LLM output: {raw[:200]!r}")
+    depth = 0
+    for i in range(last_close, -1, -1):
+        if s[i] == "}":
+            depth += 1
+        elif s[i] == "{":
+            depth -= 1
+            if depth == 0:
+                return json.loads(s[i:last_close + 1])
+    raise ValueError(f"unbalanced braces: {raw[:200]!r}")
+
+
+def _validate(payload: dict, schema: dict) -> None:
+    from jsonschema import Draft202012Validator, ValidationError
+    try:
+        Draft202012Validator(schema).validate(payload)
+    except ValidationError as e:
+        raise ValueError(
+            f"output_schema violation: {e.message} at {list(e.absolute_path)}"
+        )
+
+
 def invoke_agent(persona, task, context) -> dict:
-    raise NotImplementedError("real Hermes integration lands in a follow-up plan")
+    # Lazy import keeps `__main__` startup light (AC5).
+    from run_agent import AIAgent
+    agent = AIAgent(
+        model=persona.default_model,
+        provider="openai",
+        api_key="not-needed",          # loopback shim doesn't auth
+        base_url=_HERMES_BASE_URL,
+        api_mode="chat_completions",
+        enabled_toolsets=_toolsets_for(persona),
+        ephemeral_system_prompt=persona.system_prompt,
+        quiet_mode=True,
+        skip_memory=True,
+        skip_context_files=True,
+    )
+    raw = agent.chat(_render_prompt(task, context, persona.output_schema))
+    payload = _extract_json(raw)
+    _validate(payload, persona.output_schema)
+    return payload
 
 
 def record_event(payload) -> None:
