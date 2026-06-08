@@ -239,3 +239,96 @@ def test_consumer_returns_quietly_when_file_vanishes_between_glob_and_read(tmp_p
     with patch.object(Path, "read_text", vanish_on_inbox):
         # Must return without raising
         run_once(inbox_dir=inbox, results_dir=results, persona_dir=personas)
+
+
+# ---------------------------------------------------------------------------
+# New __main__ entrypoint tests (G1)
+# ---------------------------------------------------------------------------
+
+
+def test_main_block_refuses_to_start_when_flag_disabled(monkeypatch) -> None:
+    """G1.1 — __main__ block refuses to start when ZENOPS_CONSUMER_ENABLED != 'true'."""
+    from agent.specialists.consumer import ConsumerDisabledError, start
+
+    monkeypatch.setenv("ZENOPS_CONSUMER_ENABLED", "false")
+    with pytest.raises(ConsumerDisabledError):
+        start()
+
+
+def test_main_loop_processes_one_then_continues(monkeypatch, tmp_path: Path) -> None:
+    """G1.2 — _main_loop processes one dispatch then continues polling."""
+    import time
+    from agent.specialists.consumer import _main_loop
+
+    inbox = tmp_path / "brain-inbox"
+    results = tmp_path / "results"
+    personas = _make_persona_dir(tmp_path / "personas")
+    inbox.mkdir()
+    results.mkdir()
+
+    # Pre-populate inbox with one dispatch
+    _write_dispatch(inbox, "task-main", "Scout")
+
+    call_count = 0
+
+    def mock_sleep(interval):
+        nonlocal call_count
+        call_count += 1
+        if call_count >= 2:
+            raise KeyboardInterrupt("stop after 2 calls")
+        return None
+
+    monkeypatch.setenv("BRAIN_INBOX_PATH", str(inbox))
+    monkeypatch.setenv("RESULTS_PATH", str(results))
+    monkeypatch.setenv("HERMES_PERSONA_DIR", str(personas))
+
+    with patch("agent.specialists.consumer.run_once") as mock_run_once, \
+         patch.object(time, "sleep", side_effect=mock_sleep):
+        try:
+            _main_loop(poll_interval_sec=0.05)
+        except KeyboardInterrupt:
+            pass
+
+    # run_once should have been called at least once
+    assert mock_run_once.call_count >= 1, "_main_loop should call run_once"
+    # Check that run_once was passed the correct paths
+    call_args = mock_run_once.call_args
+    assert call_args[0][0] == inbox or call_args[1].get("inbox_dir") == inbox
+
+
+def test_main_loop_survives_run_once_exception(monkeypatch, tmp_path: Path, capsys) -> None:
+    """G1.3 — _main_loop catches and logs run_once exceptions, continues looping."""
+    import time
+    from agent.specialists.consumer import _main_loop
+
+    inbox = tmp_path / "brain-inbox"
+    results = tmp_path / "results"
+    personas = _make_persona_dir(tmp_path / "personas")
+    inbox.mkdir()
+    results.mkdir()
+
+    call_count = 0
+
+    def mock_sleep(interval):
+        nonlocal call_count
+        call_count += 1
+        if call_count >= 2:
+            raise KeyboardInterrupt("stop after 2 calls")
+        return None
+
+    monkeypatch.setenv("BRAIN_INBOX_PATH", str(inbox))
+    monkeypatch.setenv("RESULTS_PATH", str(results))
+    monkeypatch.setenv("HERMES_PERSONA_DIR", str(personas))
+
+    with patch("agent.specialists.consumer.run_once", side_effect=RuntimeError("boom")), \
+         patch.object(time, "sleep", side_effect=mock_sleep):
+        # Must not raise; exception should be caught and logged
+        try:
+            _main_loop(poll_interval_sec=0.05)
+        except KeyboardInterrupt:
+            pass
+
+    # Verify exception was logged to stderr
+    captured = capsys.readouterr()
+    assert "boom" in captured.err, "_main_loop should log run_once exceptions to stderr"
+
