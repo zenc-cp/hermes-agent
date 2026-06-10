@@ -50,6 +50,13 @@ logger = logging.getLogger(__name__)
 # ``model.entra.scope`` in config.yaml.
 SCOPE_AI_AZURE_DEFAULT = "https://ai.azure.com/.default"
 
+# Azure-OpenAI (legacy ``*.cognitiveservices.azure.com`` resource) inference
+# scope. Used by the ZenOps fallback path (zenbrain#64) and any other
+# deployment that exposes the AOAI ``/openai/deployments/...`` URL shape.
+# The bare ``cognitiveservices.azure.com`` audience is the documented
+# Microsoft default for the AOAI data plane.
+SCOPE_COGNITIVE_SERVICES_DEFAULT = "https://cognitiveservices.azure.com/.default"
+
 # ---------------------------------------------------------------------------
 # Lazy SDK import — only loaded when the Entra path is actually used.
 # ---------------------------------------------------------------------------
@@ -148,15 +155,24 @@ class EntraIdentityConfig:
 
     scope: str = SCOPE_AI_AZURE_DEFAULT
     exclude_interactive_browser: bool = True
+    # Optional user-assigned managed-identity client ID. Passed as
+    # ``managed_identity_client_id=`` to ``DefaultAzureCredential`` so the
+    # IMDS endpoint mints a token for the chosen UAMI instead of the
+    # system-assigned identity. Empty string (default) leaves the SDK to
+    # pick whichever identity the standard chain resolves first.
+    client_id: str = ""
 
     def __post_init__(self) -> None:
         scope = str(self.scope or "").strip() or SCOPE_AI_AZURE_DEFAULT
         object.__setattr__(self, "scope", scope)
+        client_id = str(self.client_id or "").strip()
+        object.__setattr__(self, "client_id", client_id)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
             "scope": self.scope,
             "exclude_interactive_browser": self.exclude_interactive_browser,
+            "client_id": self.client_id,
         }
 
     @classmethod
@@ -165,9 +181,11 @@ class EntraIdentityConfig:
         data = data or {}
         scope = str(data.get("scope") or "").strip() or default_scope or SCOPE_AI_AZURE_DEFAULT
         exclude_browser = bool(data.get("exclude_interactive_browser", True))
+        client_id = str(data.get("client_id") or "").strip()
         return cls(
             scope=scope,
             exclude_interactive_browser=exclude_browser,
+            client_id=client_id,
         )
 
 
@@ -187,6 +205,11 @@ def _build_default_credential(config: EntraIdentityConfig) -> Any:
     # explicitly opts in to interactive browser auth.
     if not config.exclude_interactive_browser:
         kwargs["exclude_interactive_browser_credential"] = False
+    # zenbrain#64 — user-assigned managed identity pinning. Only forward
+    # when the user has configured a non-empty client_id; the SDK default
+    # picks whichever identity the chain resolves first.
+    if config.client_id:
+        kwargs["managed_identity_client_id"] = config.client_id
     return ai.DefaultAzureCredential(**kwargs)
 
 
@@ -543,6 +566,7 @@ def build_bearer_http_client(token_provider: Callable[[], str], **httpx_kwargs: 
 __all__ = [
     "EntraIdentityConfig",
     "SCOPE_AI_AZURE_DEFAULT",
+    "SCOPE_COGNITIVE_SERVICES_DEFAULT",
     "build_bearer_http_client",
     "build_credential",
     "build_token_provider",
