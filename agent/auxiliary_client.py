@@ -3420,6 +3420,10 @@ def resolve_provider_client(
     api_mode: str = None,
     main_runtime: Optional[Dict[str, Any]] = None,
     is_vision: bool = False,
+    auth_mode: Optional[str] = None,
+    client_id: Optional[str] = None,
+    api_version: Optional[str] = None,
+    entra: Optional[Dict[str, Any]] = None,
 ) -> Tuple[Optional[Any], Optional[str]]:
     """Central router: given a provider name and optional model, return a
     configured client with the correct auth, base URL, and API format.
@@ -3840,6 +3844,10 @@ def resolve_provider_client(
             explicit_api_key=explicit_api_key,
             explicit_base_url=explicit_base_url,
             api_mode=api_mode,
+            explicit_auth_mode=auth_mode,
+            explicit_client_id=client_id,
+            explicit_api_version=api_version,
+            explicit_entra=entra,
         )
         if client is None:
             logger.warning(

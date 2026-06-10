@@ -1080,10 +1080,32 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         # (not substring) — see GHSA-76xc-57q6-vm5m.
         if fb_base_url_hint and base_url_host_matches(fb_base_url_hint, "ollama.com") and not fb_api_key_hint:
             fb_api_key_hint = os.getenv("OLLAMA_API_KEY") or None
+
+        # zenbrain#64 — forward per-fallback-entry Azure Entra fields so
+        # the runtime resolver honors them. Without this, a
+        # ``fallback_model: { provider: azure-foundry, auth_mode: entra_id,
+        # client_id: ..., api_version: ... }`` block silently fell back to
+        # the top-level model config's auth_mode and 401'd.
+        fb_azure_kwargs: Dict[str, Any] = {}
+        if fb_provider == "azure-foundry":
+            _fb_auth_mode = str(fb.get("auth_mode") or "").strip() or None
+            _fb_client_id = str(fb.get("client_id") or "").strip() or None
+            _fb_api_version = str(fb.get("api_version") or "").strip() or None
+            _fb_entra = fb.get("entra") if isinstance(fb.get("entra"), dict) else None
+            if _fb_auth_mode:
+                fb_azure_kwargs["auth_mode"] = _fb_auth_mode
+            if _fb_client_id:
+                fb_azure_kwargs["client_id"] = _fb_client_id
+            if _fb_api_version:
+                fb_azure_kwargs["api_version"] = _fb_api_version
+            if _fb_entra:
+                fb_azure_kwargs["entra"] = _fb_entra
+
         fb_client, _resolved_fb_model = resolve_provider_client(
             fb_provider, model=fb_model, raw_codex=True,
             explicit_base_url=fb_base_url_hint,
-            explicit_api_key=fb_api_key_hint)
+            explicit_api_key=fb_api_key_hint,
+            **fb_azure_kwargs)
         if fb_client is None:
             logger.warning(
                 "Fallback to %s failed: provider not configured",
