@@ -231,17 +231,38 @@ def run_once(
         print(f"[consumer] inbox file vanished before lease: {inbox_file}", file=sys.stderr)
         return
 
-    # Review BLOCKER fix (2026-06-10 22:38): refresh mtime AFTER lease so
-    # the reaper's "stale processing" check measures lease-age, not
-    # original-inbox-age. os.replace preserves mtime; without this, a file
-    # that sat in inbox for 60+ min then got claimed would be reaped as
-    # "stale" within milliseconds, even though work is actively in-flight.
+    # Review BLOCKER fix (2026-06-10 22:38): refresh mtime AFTER lease so the
+    # reaper's "stale processing" check measures lease-age, not original
+    # inbox-age. os.replace preserves mtime.
+    # Review HIGH hardening (2026-06-10 22:50): if utime fails OR fails
+    # silently (some container mounts return success without refreshing the
+    # mtime), the reaper would false-abandon the freshly-claimed task — the
+    # exact bug the F2 mtime fix was meant to prevent. Verify the refresh
+    # took effect; on failure, roll back the lease so another worker can
+    # retry rather than continuing with corrupt lease semantics.
+    import time as _time
     try:
         os.utime(processing_file, None)
+        refreshed_age_s = _time.time() - processing_file.stat().st_mtime
+        if refreshed_age_s > 60:
+            raise OSError(
+                f"os.utime returned success but mtime still {refreshed_age_s:.0f}s old"
+            )
     except OSError as exc:
-        # Best-effort; if utime fails we proceed but log so the reaper risk
-        # is at least visible in stderr.
-        print(f"[consumer] os.utime failed on {processing_file}: {exc}", file=sys.stderr)
+        print(
+            f"[consumer] lease mtime refresh failed for {task_id}: {exc}; rolling back lease",
+            file=sys.stderr,
+            flush=True,
+        )
+        try:
+            os.replace(str(processing_file), str(inbox_file))
+        except OSError as rollback_exc:
+            print(
+                f"[consumer] lease rollback also failed for {task_id}: {rollback_exc}",
+                file=sys.stderr,
+                flush=True,
+            )
+        return
 
     # From here on, we own processing_file. Delete it on every terminal branch.
     # If an unexpected exception escapes, the file stays for the reaper.

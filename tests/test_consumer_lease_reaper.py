@@ -353,3 +353,81 @@ def test_lease_mtime_refresh_prevents_premature_reap_on_long_invoke(tmp_path: Pa
         "to lease time, not inherited from old inbox mtime"
     )
     assert processing_file.exists(), "leased file must still be in processing"
+
+
+# ---------------------------------------------------------------------------
+# Review HIGH hardening (2026-06-10 22:50): if os.utime fails or fails
+# silently (returns success without refreshing mtime, observed in some
+# container-mount scenarios), run_once must ROLL BACK the lease (move file
+# back to inbox) rather than proceed with corrupt lease semantics that would
+# trigger the very bug the F2 mtime-refresh was meant to prevent.
+# ---------------------------------------------------------------------------
+
+
+def test_lease_rolls_back_when_utime_fails(tmp_path: Path) -> None:
+    """If os.utime raises, run_once must move the file back to inbox and
+    return early — invoke_agent must NOT fire, results dir stays empty."""
+    from agent.specialists.consumer import run_once
+
+    inbox = tmp_path / "brain-inbox"
+    results = tmp_path / "results"
+    personas = _make_persona_dir(tmp_path / "personas")
+    inbox.mkdir()
+    results.mkdir()
+    f = _write_dispatch_with_meta(inbox, "t-utime-fail", "Scout")
+
+    # Patch os.utime to fail with PermissionError (a real OSError subclass).
+    real_utime = os.utime
+    def failing_utime(path, times):
+        raise PermissionError(f"simulated utime failure on {path}")
+
+    with patch("agent.specialists.consumer.os.utime", side_effect=failing_utime), \
+         patch("agent.specialists.consumer.invoke_agent") as mock_invoke, \
+         patch("agent.specialists.consumer.record_event"):
+        run_once(inbox_dir=inbox, results_dir=results, persona_dir=personas)
+
+    assert not mock_invoke.called, (
+        "invoke_agent must NOT fire when lease mtime refresh fails — "
+        "the lease is rolled back, not committed"
+    )
+    # File should be back in inbox after rollback.
+    assert (inbox / "t-utime-fail.json").exists(), (
+        "lease rollback must move file back to inbox so another worker can retry"
+    )
+    # Processing dir should be empty.
+    assert list((inbox / ".processing").glob("*.json")) == []
+    # No result file written.
+    assert not (results / "t-utime-fail.json").exists()
+
+
+def test_lease_rolls_back_when_utime_returns_success_but_mtime_not_refreshed(tmp_path: Path) -> None:
+    """Silent-failure case: os.utime returns success but mtime stays old
+    (observed in some container-mount scenarios). The verification check
+    after os.utime must detect this and trigger lease rollback."""
+    from agent.specialists.consumer import run_once
+
+    inbox = tmp_path / "brain-inbox"
+    results = tmp_path / "results"
+    personas = _make_persona_dir(tmp_path / "personas")
+    inbox.mkdir()
+    results.mkdir()
+    f = _write_dispatch_with_meta(inbox, "t-silent-utime", "Scout")
+    # Backdate inbox file so post-utime check sees stale mtime.
+    old_ts = time.time() - 7200
+    os.utime(f, (old_ts, old_ts))
+
+    # Patch os.utime to no-op (return success without actually refreshing).
+    def silent_utime(path, times):
+        return None  # pretend to succeed; do nothing
+
+    with patch("agent.specialists.consumer.os.utime", side_effect=silent_utime), \
+         patch("agent.specialists.consumer.invoke_agent") as mock_invoke, \
+         patch("agent.specialists.consumer.record_event"):
+        run_once(inbox_dir=inbox, results_dir=results, persona_dir=personas)
+
+    assert not mock_invoke.called, (
+        "silent os.utime failure must be detected via mtime verification; "
+        "invoke_agent must NOT fire"
+    )
+    assert (inbox / "t-silent-utime.json").exists(), "lease must be rolled back"
+    assert list((inbox / ".processing").glob("*.json")) == []
