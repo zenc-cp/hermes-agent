@@ -99,6 +99,37 @@ class _OpenAIProxy:
 
 OpenAI = _OpenAIProxy()  # module-level name, resolves lazily on call/isinstance
 
+# Mirror the lazy proxy pattern for ``AzureOpenAI`` so the AOAI deployment
+# URL path can be constructed on demand (zenbrain#64). The proxy keeps
+# the cold-import savings AND lets ``monkeypatch.setattr(_aux,
+# "AzureOpenAI", ...)`` work in tests.
+_AZURE_OPENAI_CLS_CACHE: Optional[type] = None
+
+
+def _load_azure_openai_cls() -> type:
+    """Import and cache ``openai.AzureOpenAI``."""
+    global _AZURE_OPENAI_CLS_CACHE
+    if _AZURE_OPENAI_CLS_CACHE is None:
+        from openai import AzureOpenAI as _cls
+        _AZURE_OPENAI_CLS_CACHE = _cls
+    return _AZURE_OPENAI_CLS_CACHE
+
+
+class _AzureOpenAIProxy:
+    __slots__ = ()
+
+    def __call__(self, *args, **kwargs):
+        return _load_azure_openai_cls()(*args, **kwargs)
+
+    def __instancecheck__(self, obj):
+        return isinstance(obj, _load_azure_openai_cls())
+
+    def __repr__(self):
+        return "<lazy openai.AzureOpenAI proxy>"
+
+
+AzureOpenAI = _AzureOpenAIProxy()
+
 from agent.credential_pool import load_pool
 from hermes_cli.config import get_hermes_home
 from hermes_constants import OPENROUTER_BASE_URL
@@ -2066,6 +2097,10 @@ def _try_azure_foundry(
     explicit_api_key: Optional[str] = None,
     explicit_base_url: Optional[str] = None,
     api_mode: Optional[str] = None,
+    explicit_auth_mode: Optional[str] = None,
+    explicit_client_id: Optional[str] = None,
+    explicit_api_version: Optional[str] = None,
+    explicit_entra: Optional[Dict[str, Any]] = None,
 ) -> Tuple[Optional[Any], Optional[str]]:
     """Resolve an Azure Foundry auxiliary client via the runtime resolver.
 
@@ -2111,6 +2146,10 @@ def _try_azure_foundry(
             explicit_api_key=explicit_api_key,
             explicit_base_url=explicit_base_url,
             target_model=model,
+            explicit_auth_mode=explicit_auth_mode,
+            explicit_client_id=explicit_client_id,
+            explicit_api_version=explicit_api_version,
+            explicit_entra=explicit_entra,
         )
     except AuthError as exc:
         logger.debug("Auxiliary azure-foundry: %s", exc)
@@ -2151,6 +2190,26 @@ def _try_azure_foundry(
     _clean_base, _dq = _extract_url_query_params(base_url)
     if _dq:
         extra["default_query"] = _dq
+
+    # zenbrain#64 — bare ``*.cognitiveservices.azure.com`` resources need the
+    # AOAI ``/openai/deployments/{deployment}/chat/completions?api-version=...``
+    # URL shape. ``AzureOpenAI`` constructs that path natively when given
+    # ``azure_endpoint``+``api_version``. The plain ``OpenAI`` client would
+    # instead hit ``{base}/chat/completions`` and 404 (or 401 against the
+    # wrong audience).
+    if runtime.get("is_cognitive_services") and runtime_api_mode == "chat_completions":
+        azure_kwargs: Dict[str, Any] = {
+            "azure_endpoint": _clean_base,
+            "api_version": runtime.get("api_version") or "2024-10-21",
+        }
+        if callable(api_key):
+            azure_kwargs["azure_ad_token_provider"] = api_key
+        else:
+            azure_kwargs["api_key"] = api_key
+        if _dq:
+            azure_kwargs["default_query"] = _dq
+        client = AzureOpenAI(**azure_kwargs)
+        return client, final_model
 
     client = OpenAI(api_key=api_key, base_url=_clean_base, **extra)
 
