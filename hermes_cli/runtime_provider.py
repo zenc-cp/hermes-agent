@@ -911,6 +911,10 @@ def _resolve_azure_foundry_runtime(
     explicit_api_key: Optional[str] = None,
     explicit_base_url: Optional[str] = None,
     target_model: Optional[str] = None,
+    explicit_auth_mode: Optional[str] = None,
+    explicit_client_id: Optional[str] = None,
+    explicit_api_version: Optional[str] = None,
+    explicit_entra: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Resolve an Azure Foundry runtime entry.
 
@@ -938,13 +942,31 @@ def _resolve_azure_foundry_runtime(
     cfg_api_mode = "chat_completions"
     cfg_auth_mode = "api_key"
     cfg_entra: Dict[str, Any] = {}
+    cfg_client_id = ""
+    cfg_api_version = ""
     if cfg_provider == "azure-foundry":
         cfg_base_url = str(model_cfg.get("base_url") or "").strip().rstrip("/")
         cfg_api_mode = _parse_api_mode(model_cfg.get("api_mode")) or "chat_completions"
         cfg_auth_mode = str(model_cfg.get("auth_mode") or "api_key").strip().lower() or "api_key"
+        cfg_client_id = str(model_cfg.get("client_id") or "").strip()
+        cfg_api_version = str(model_cfg.get("api_version") or "").strip()
         _entra = model_cfg.get("entra")
         if isinstance(_entra, dict):
             cfg_entra = _entra
+
+    # zenbrain#64 — per-fallback-entry overrides win over top-level model
+    # config. Without these, a ``fallback_model: { auth_mode: entra_id, ... }``
+    # block is silently dropped because ``_try_azure_foundry`` reads
+    # ``load_config()`` (which only sees the primary model block).
+    if explicit_auth_mode:
+        cfg_auth_mode = str(explicit_auth_mode).strip().lower() or cfg_auth_mode
+    if explicit_client_id:
+        cfg_client_id = str(explicit_client_id).strip()
+    if explicit_api_version:
+        cfg_api_version = str(explicit_api_version).strip()
+    if isinstance(explicit_entra, dict) and explicit_entra:
+        # Merge: explicit overrides win over file-level entra block.
+        cfg_entra = {**cfg_entra, **explicit_entra}
 
     # Model-family inference: Azure Foundry deploys GPT-5.x / codex / o1-o4
     # reasoning models as Responses-API-only.  Calling /chat/completions
@@ -989,6 +1011,19 @@ def _resolve_azure_foundry_runtime(
     # natively). From the runtime resolver's perspective both modes
     # are identical — return the callable api_key and let the
     # downstream SDK wrapper handle the contract difference.
+    # zenbrain#64 — bare ``*.cognitiveservices.azure.com`` resources are the
+    # legacy Azure OpenAI data plane. They use the AOAI deployment URL
+    # ``/openai/deployments/{deployment}/chat/completions?api-version=...``
+    # (constructed downstream by ``AzureOpenAI``) and the bare
+    # ``cognitiveservices.azure.com`` token audience — different from
+    # the Foundry-Projects ``ai.azure.com`` audience.
+    _is_cognitive_services_host = bool(
+        re.search(r"\bcognitiveservices\.azure\.com/?$", base_url)
+    )
+    api_version = cfg_api_version or ""
+    if _is_cognitive_services_host and not api_version:
+        api_version = "2024-10-21"
+
     if cfg_auth_mode == "entra_id":
         if explicit_api_key:
             # User passed --api-key on the CLI while config says entra_id —
@@ -1001,6 +1036,7 @@ def _resolve_azure_foundry_runtime(
                 from agent.azure_identity_adapter import (
                     EntraIdentityConfig,
                     SCOPE_AI_AZURE_DEFAULT,
+                    SCOPE_COGNITIVE_SERVICES_DEFAULT,
                     build_token_provider,
                 )
             except Exception as exc:
@@ -1010,13 +1046,19 @@ def _resolve_azure_foundry_runtime(
                     f"(import failed: {exc})"
                 ) from exc
 
+            default_scope = (
+                SCOPE_COGNITIVE_SERVICES_DEFAULT
+                if _is_cognitive_services_host
+                else SCOPE_AI_AZURE_DEFAULT
+            )
             scope = (
                 str(cfg_entra.get("scope") or "").strip()
-                or SCOPE_AI_AZURE_DEFAULT
+                or default_scope
             )
             try:
                 entra_config = EntraIdentityConfig(
                     scope=scope,
+                    client_id=cfg_client_id,
                 )
                 token_provider = build_token_provider(config=entra_config)
             except ImportError as exc:
@@ -1031,7 +1073,7 @@ def _resolve_azure_foundry_runtime(
             if configured_scope:
                 clean_entra["scope"] = configured_scope
 
-        return {
+        result = {
             "provider": "azure-foundry",
             "api_mode": cfg_api_mode,
             "base_url": base_url,
@@ -1040,7 +1082,13 @@ def _resolve_azure_foundry_runtime(
             "entra": clean_entra,
             "source": source,
             "requested_provider": requested_provider,
+            "is_cognitive_services": _is_cognitive_services_host,
         }
+        if cfg_client_id:
+            result["client_id"] = cfg_client_id
+        if api_version:
+            result["api_version"] = api_version
+        return result
 
     # ── Static API key (legacy / default) ──────────────────────────────
     api_key = explicit_api_key
@@ -1062,7 +1110,7 @@ def _resolve_azure_foundry_runtime(
         )
 
     source = "explicit" if (explicit_api_key or explicit_base_url) else "config"
-    return {
+    result_apikey: Dict[str, Any] = {
         "provider": "azure-foundry",
         "api_mode": cfg_api_mode,
         "base_url": base_url,
@@ -1070,7 +1118,11 @@ def _resolve_azure_foundry_runtime(
         "auth_mode": "api_key",
         "source": source,
         "requested_provider": requested_provider,
+        "is_cognitive_services": _is_cognitive_services_host,
     }
+    if api_version:
+        result_apikey["api_version"] = api_version
+    return result_apikey
 
 
 def _resolve_explicit_runtime(
