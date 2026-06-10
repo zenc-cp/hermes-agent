@@ -280,3 +280,76 @@ def test_main_loop_invokes_reaper(monkeypatch, tmp_path: Path) -> None:
             pass
 
     assert mock_reaper.called, "_main_loop must call reap_stale_processing on every tick"
+
+
+# ---------------------------------------------------------------------------
+# Review BLOCKER fix (2026-06-10 22:38): lease must refresh mtime so the
+# reaper doesn't false-abandon a freshly-claimed task whose inbox file was
+# old. Pre-fix, os.replace preserved mtime, so a 60-min-old inbox file got
+# claimed and then reaped within seconds even though work was active.
+# ---------------------------------------------------------------------------
+
+
+def test_lease_refreshes_mtime_so_old_inbox_file_isnt_immediately_reaped(tmp_path: Path) -> None:
+    from agent.specialists.consumer import run_once, reap_stale_processing
+
+    inbox = tmp_path / "brain-inbox"
+    results = tmp_path / "results"
+    personas = _make_persona_dir(tmp_path / "personas")
+    inbox.mkdir()
+    results.mkdir()
+
+    # Write a dispatch file and BACKDATE its mtime by 2 hours (simulates Scout
+    # writing it long ago while consumer was offline).
+    f = _write_dispatch_with_meta(inbox, "t-old-inbox", "Scout", ttl_sec=3600)
+    old_ts = time.time() - 7200
+    os.utime(f, (old_ts, old_ts))
+
+    # Now run_once claims the file. After the lease, the processing file's
+    # mtime MUST be recent, otherwise the reaper will immediately abandon it.
+    with patch("agent.specialists.consumer.invoke_agent", return_value={"findings": []}), \
+         patch("agent.specialists.consumer.record_event"):
+        run_once(inbox_dir=inbox, results_dir=results, persona_dir=personas)
+
+    # Happy path: file processed cleanly, processing dir empty.
+    assert list((inbox / ".processing").glob("*.json")) == []
+    body = json.loads((results / "t-old-inbox.json").read_text(encoding="utf-8"))
+    assert body["status"] == "completed"
+
+
+def test_lease_mtime_refresh_prevents_premature_reap_on_long_invoke(tmp_path: Path) -> None:
+    """End-to-end: claim a file from an OLD inbox entry, simulate a long
+    invoke by stopping just before invoke_agent, then run the reaper with
+    max_age_s=30. The processing file should NOT be reaped because its
+    mtime was refreshed at lease time."""
+    from agent.specialists import consumer
+    from agent.specialists.consumer import reap_stale_processing
+
+    inbox = tmp_path / "brain-inbox"
+    results = tmp_path / "results"
+    personas = _make_persona_dir(tmp_path / "personas")
+    processing = inbox / ".processing"
+    inbox.mkdir()
+    results.mkdir()
+    processing.mkdir()
+
+    # Backdate inbox file by 2 hours.
+    f = _write_dispatch_with_meta(inbox, "t-leased", "Scout", ttl_sec=3600)
+    old_ts = time.time() - 7200
+    os.utime(f, (old_ts, old_ts))
+
+    # Manually perform the lease step exactly as run_once does (move + utime),
+    # then DON'T invoke. This isolates the lease-mtime contract.
+    processing_file = processing / "t-leased.json"
+    os.replace(str(f), str(processing_file))
+    os.utime(processing_file, None)
+
+    # Reaper with 30s max_age must NOT reap the freshly-leased file.
+    with patch("agent.specialists.consumer.record_event"):
+        reaped = reap_stale_processing(processing, results, max_age_s=30)
+
+    assert reaped == 0, (
+        "freshly-leased file must not be reaped — mtime should be refreshed "
+        "to lease time, not inherited from old inbox mtime"
+    )
+    assert processing_file.exists(), "leased file must still be in processing"

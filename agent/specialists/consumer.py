@@ -231,6 +231,18 @@ def run_once(
         print(f"[consumer] inbox file vanished before lease: {inbox_file}", file=sys.stderr)
         return
 
+    # Review BLOCKER fix (2026-06-10 22:38): refresh mtime AFTER lease so
+    # the reaper's "stale processing" check measures lease-age, not
+    # original-inbox-age. os.replace preserves mtime; without this, a file
+    # that sat in inbox for 60+ min then got claimed would be reaped as
+    # "stale" within milliseconds, even though work is actively in-flight.
+    try:
+        os.utime(processing_file, None)
+    except OSError as exc:
+        # Best-effort; if utime fails we proceed but log so the reaper risk
+        # is at least visible in stderr.
+        print(f"[consumer] os.utime failed on {processing_file}: {exc}", file=sys.stderr)
+
     # From here on, we own processing_file. Delete it on every terminal branch.
     # If an unexpected exception escapes, the file stays for the reaper.
 
