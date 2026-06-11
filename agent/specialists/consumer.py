@@ -1,4 +1,4 @@
-"""ADR-025 brain-inbox consumer — processes one dispatch file per call (run_once).
+﻿"""ADR-025 brain-inbox consumer â€” processes one dispatch file per call (run_once).
 
 Audit F2 fix (2026-06-10): added lease-via-processing-dir and TTL expiry +
 stale-file reaper. Pre-fix the consumer deleted the inbox file in a `finally`
@@ -21,13 +21,22 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from agent.specialists.persona import load_persona
+from agent.specialists import observability as _obs
+
+
+def _safe_emit(task_id: str, event: str, payload: dict | None = None) -> None:
+    """Defense-in-depth: observability MUST NOT break dispatch processing."""
+    try:
+        _obs.emit(task_id, event, payload)
+    except Exception:
+        pass
 
 
 class ConsumerDisabledError(RuntimeError):
     """Raised when ZENOPS_CONSUMER_ENABLED != 'true'."""
 
 
-# Map persona tool names → toolset names that AIAgent.enabled_toolsets accepts.
+# Map persona tool names â†’ toolset names that AIAgent.enabled_toolsets accepts.
 # Verified against toolsets.py:TOOLSETS (2026-06-08).
 _TOOL_TO_TOOLSET = {
     "web_search":   "web",
@@ -37,7 +46,7 @@ _TOOL_TO_TOOLSET = {
     "write_file":   "file",
 }
 
-# VM loopback inference shim — no auth, OpenAI-compatible.
+# VM loopback inference shim â€” no auth, OpenAI-compatible.
 _HERMES_BASE_URL = "http://127.0.0.1:8403/v1"
 
 # Audit F2 (2026-06-10): reaper defaults.
@@ -65,14 +74,14 @@ def _render_prompt(task: str, context: dict, schema: dict) -> str:
     return (
         f"TASK:\n{task}\n\n"
         f"CONTEXT:\n{json.dumps(context, indent=2)}\n\n"
-        f"OUTPUT FORMAT — return ONLY a JSON object matching this schema:\n"
+        f"OUTPUT FORMAT â€” return ONLY a JSON object matching this schema:\n"
         f"{json.dumps(schema, indent=2)}\n\n"
         f"No prose. No markdown fences. Just the JSON object."
     )
 
 
 def _extract_json(raw: str) -> dict:
-    """Find the LAST balanced {...} block — models often write prose then JSON."""
+    """Find the LAST balanced {...} block â€” models often write prose then JSON."""
     import json
     try:
         return json.loads(raw)
@@ -166,7 +175,7 @@ def _ttl_expired(envelope: dict) -> bool:
     """True if envelope.created_at + task.ttl_sec is in the past."""
     created = _parse_created_at(envelope.get("created_at") or envelope.get("enqueued_at"))
     if created is None:
-        return False  # No created_at → cannot judge, allow run
+        return False  # No created_at â†’ cannot judge, allow run
     task = envelope.get("task") or {}
     ttl_sec = task.get("ttl_sec")
     if not isinstance(ttl_sec, (int, float)) or ttl_sec <= 0:
@@ -213,7 +222,7 @@ def run_once(
 
     inbox_file = dispatch_files[0]
 
-    # Fix 5 (preserved): TOCTOU guard — another worker may delete the file
+    # Fix 5 (preserved): TOCTOU guard â€” another worker may delete the file
     # between glob and read. Read FIRST so existing TOCTOU semantics hold
     # (mocks patching Path.read_text on inbox files still fire here).
     try:
@@ -236,7 +245,7 @@ def run_once(
     # inbox-age. os.replace preserves mtime.
     # Review HIGH hardening (2026-06-10 22:50): if utime fails OR fails
     # silently (some container mounts return success without refreshing the
-    # mtime), the reaper would false-abandon the freshly-claimed task — the
+    # mtime), the reaper would false-abandon the freshly-claimed task â€” the
     # exact bug the F2 mtime fix was meant to prevent. Verify the refresh
     # took effect; on failure, roll back the lease so another worker can
     # retry rather than continuing with corrupt lease semantics.
@@ -267,6 +276,9 @@ def run_once(
     # From here on, we own processing_file. Delete it on every terminal branch.
     # If an unexpected exception escapes, the file stays for the reaper.
 
+    # ADR-032: emit leased event (best-effort)
+    _safe_emit(task_id, "leased")
+
     # Fix 1 (preserved): Malformed JSON must not jam the inbox.
     try:
         dispatch = json.loads(raw)
@@ -284,6 +296,7 @@ def run_once(
             "tool_calls": 0,
         }
         _write_status_atomic(results_dir, task_id, status_payload)
+        _safe_emit(task_id, "failed", {"reason": "malformed_json"})
         _safe_record_event({
             "event_type": "dispatch_failed",
             "task_id": task_id,
@@ -310,6 +323,7 @@ def run_once(
             "tool_calls": 0,
         }
         _write_status_atomic(results_dir, status_payload["task_id"], status_payload)
+        _safe_emit(status_payload["task_id"], "expired")
         _safe_record_event({
             "event_type": "dispatch_failed",
             "task_id": status_payload["task_id"],
@@ -343,6 +357,7 @@ def run_once(
             "tool_calls": 0,
         }
         _write_status_atomic(results_dir, task_id, status_payload)
+        _safe_emit(task_id, "failed", {"reason": "persona_load", "specialist": specialist})
         _safe_record_event({
             "event_type": "dispatch_failed",
             "task_id": task_id,
@@ -375,6 +390,7 @@ def run_once(
             "tool_calls": 0,
         }
         _write_status_atomic(results_dir, task_id, status_payload)
+        _safe_emit(task_id, "failed", {"reason": "invoke_error", "specialist": specialist, "latency_ms": latency_ms})
         _safe_record_event({
             "event_type": "dispatch_failed",
             "task_id": task_id,
@@ -403,6 +419,7 @@ def run_once(
         "tool_calls": 0,
     }
     _write_status_atomic(results_dir, task_id, status_payload)
+    _safe_emit(task_id, "completed", {"specialist": specialist, "latency_ms": latency_ms, "model": persona.default_model})
     _safe_record_event({
         "event_type": "dispatch_completed",
         "task_id": task_id,
@@ -475,6 +492,7 @@ def reap_stale_processing(
         except OSError as exc:
             print(f"[reaper] failed to write abandoned status for {task_id}: {exc}", file=sys.stderr)
             continue
+        _safe_emit(task_id, "reaped", {"specialist": specialist, "age_s": int(age_s)})
         _safe_record_event({
             "event_type": "dispatch_failed",
             "task_id": task_id,
