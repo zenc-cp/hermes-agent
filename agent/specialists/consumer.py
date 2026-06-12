@@ -192,6 +192,73 @@ def _safe_unlink(path: Path) -> None:
         pass
 
 
+def _record_terminal(
+    *,
+    results_dir: Path,
+    processing_file: Path | None,
+    task_id: str,
+    specialist: str | None,
+    status: str,
+    started_at: str,
+    finished_at: str,
+    latency_ms: int = 0,
+    model: str | None = None,
+    output: dict | None = None,
+    error: str | None = None,
+    tool_calls: int = 0,
+    emit_event: str | None = None,
+    emit_payload: dict | None = None,
+    record_event_type: str | None = None,
+) -> None:
+    """Single source of truth for terminal-outcome bookkeeping.
+
+    Writes the result status file, emits the observability event, records
+    the audit event, and (if processing_file is provided) drops the
+    processing-dir lease. Eliminates the 5+ near-identical blocks that
+    accumulated through Fix 1 / TTL / persona-load / invoke-error /
+    happy-path branches.
+
+    All keyword-only to keep call sites self-documenting.
+    """
+    status_payload: dict = {
+        "task_id": task_id,
+        "specialist": specialist,
+        "status": status,
+        "started_at": started_at,
+        "finished_at": finished_at,
+        "latency_ms": latency_ms,
+        "model": model,
+        "tool_calls": tool_calls,
+    }
+    if output is not None:
+        status_payload["output"] = output
+    if error is not None:
+        status_payload["error"] = error
+
+    _write_status_atomic(results_dir, task_id, status_payload)
+
+    if emit_event is not None:
+        _safe_emit(task_id, emit_event, emit_payload)
+
+    if record_event_type is not None:
+        record_payload: dict = {
+            "event_type": record_event_type,
+            "task_id": task_id,
+            "specialist": specialist,
+            "started_at": started_at,
+            "finished_at": finished_at,
+        }
+        if record_event_type == "dispatch_failed" and error is not None:
+            record_payload["error"] = error
+        if record_event_type == "dispatch_completed":
+            record_payload["model"] = model
+            record_payload["latency_ms"] = latency_ms
+        _safe_record_event(record_payload)
+
+    if processing_file is not None:
+        _safe_unlink(processing_file)
+
+
 def run_once(
     inbox_dir: Path,
     results_dir: Path,
@@ -284,55 +351,38 @@ def run_once(
         dispatch = json.loads(raw)
     except json.JSONDecodeError as exc:
         now = datetime.now(timezone.utc).isoformat()
-        status_payload = {
-            "task_id": task_id,
-            "specialist": None,
-            "status": "failed",
-            "error": f"malformed dispatch JSON: {repr(exc)}",
-            "started_at": now,
-            "finished_at": now,
-            "latency_ms": 0,
-            "model": None,
-            "tool_calls": 0,
-        }
-        _write_status_atomic(results_dir, task_id, status_payload)
-        _safe_emit(task_id, "failed", {"reason": "malformed_json"})
-        _safe_record_event({
-            "event_type": "dispatch_failed",
-            "task_id": task_id,
-            "specialist": None,
-            "error": status_payload["error"],
-            "started_at": now,
-            "finished_at": now,
-        })
-        _safe_unlink(processing_file)
+        _record_terminal(
+            results_dir=results_dir,
+            processing_file=processing_file,
+            task_id=task_id,
+            specialist=None,
+            status="failed",
+            started_at=now,
+            finished_at=now,
+            error=f"malformed dispatch JSON: {repr(exc)}",
+            emit_event="failed",
+            emit_payload={"reason": "malformed_json"},
+            record_event_type="dispatch_failed",
+        )
         return
 
     # Audit F2: TTL check before invoking the agent.
     if _ttl_expired(dispatch):
         now = datetime.now(timezone.utc).isoformat()
-        status_payload = {
-            "task_id": dispatch.get("task_id", task_id),
-            "specialist": dispatch.get("specialist"),
-            "status": "expired",
-            "error": f"task ttl_sec exceeded before invoke",
-            "started_at": now,
-            "finished_at": now,
-            "latency_ms": 0,
-            "model": None,
-            "tool_calls": 0,
-        }
-        _write_status_atomic(results_dir, status_payload["task_id"], status_payload)
-        _safe_emit(status_payload["task_id"], "expired")
-        _safe_record_event({
-            "event_type": "dispatch_failed",
-            "task_id": status_payload["task_id"],
-            "specialist": status_payload["specialist"],
-            "error": status_payload["error"],
-            "started_at": now,
-            "finished_at": now,
-        })
-        _safe_unlink(processing_file)
+        task_id_eff = dispatch.get("task_id", task_id)
+        specialist_eff = dispatch.get("specialist")
+        _record_terminal(
+            results_dir=results_dir,
+            processing_file=processing_file,
+            task_id=task_id_eff,
+            specialist=specialist_eff,
+            status="expired",
+            started_at=now,
+            finished_at=now,
+            error="task ttl_sec exceeded before invoke",
+            emit_event="expired",
+            record_event_type="dispatch_failed",
+        )
         return
 
     task_id = dispatch["task_id"]
@@ -345,28 +395,19 @@ def run_once(
         persona = load_persona(persona_dir / f"{specialist}.yaml")
     except Exception as exc:
         finished_at = datetime.now(timezone.utc).isoformat()
-        status_payload = {
-            "task_id": task_id,
-            "specialist": specialist,
-            "status": "failed",
-            "error": str(exc),
-            "started_at": started_at,
-            "finished_at": finished_at,
-            "latency_ms": 0,
-            "model": None,
-            "tool_calls": 0,
-        }
-        _write_status_atomic(results_dir, task_id, status_payload)
-        _safe_emit(task_id, "failed", {"reason": "persona_load", "specialist": specialist})
-        _safe_record_event({
-            "event_type": "dispatch_failed",
-            "task_id": task_id,
-            "specialist": specialist,
-            "error": str(exc),
-            "started_at": started_at,
-            "finished_at": finished_at,
-        })
-        _safe_unlink(processing_file)
+        _record_terminal(
+            results_dir=results_dir,
+            processing_file=processing_file,
+            task_id=task_id,
+            specialist=specialist,
+            status="failed",
+            started_at=started_at,
+            finished_at=finished_at,
+            error=str(exc),
+            emit_event="failed",
+            emit_payload={"reason": "persona_load", "specialist": specialist},
+            record_event_type="dispatch_failed",
+        )
         return
 
     # Fix 2 (preserved): invoke_agent exceptions must not jam the inbox.
@@ -378,28 +419,21 @@ def run_once(
             (datetime.fromisoformat(finished_at) - datetime.fromisoformat(started_at))
             .total_seconds() * 1000
         )
-        status_payload = {
-            "task_id": task_id,
-            "specialist": specialist,
-            "status": "failed",
-            "error": str(exc),
-            "started_at": started_at,
-            "finished_at": finished_at,
-            "latency_ms": latency_ms,
-            "model": persona.default_model,
-            "tool_calls": 0,
-        }
-        _write_status_atomic(results_dir, task_id, status_payload)
-        _safe_emit(task_id, "failed", {"reason": "invoke_error", "specialist": specialist, "latency_ms": latency_ms})
-        _safe_record_event({
-            "event_type": "dispatch_failed",
-            "task_id": task_id,
-            "specialist": specialist,
-            "error": str(exc),
-            "started_at": started_at,
-            "finished_at": finished_at,
-        })
-        _safe_unlink(processing_file)
+        _record_terminal(
+            results_dir=results_dir,
+            processing_file=processing_file,
+            task_id=task_id,
+            specialist=specialist,
+            status="failed",
+            started_at=started_at,
+            finished_at=finished_at,
+            latency_ms=latency_ms,
+            model=persona.default_model,
+            error=str(exc),
+            emit_event="failed",
+            emit_payload={"reason": "invoke_error", "specialist": specialist, "latency_ms": latency_ms},
+            record_event_type="dispatch_failed",
+        )
         return
 
     finished_at = datetime.now(timezone.utc).isoformat()
@@ -407,29 +441,21 @@ def run_once(
         (datetime.fromisoformat(finished_at) - datetime.fromisoformat(started_at))
         .total_seconds() * 1000
     )
-    status_payload = {
-        "task_id": task_id,
-        "specialist": specialist,
-        "status": "completed",
-        "output": output,
-        "started_at": started_at,
-        "finished_at": finished_at,
-        "latency_ms": latency_ms,
-        "model": persona.default_model,
-        "tool_calls": 0,
-    }
-    _write_status_atomic(results_dir, task_id, status_payload)
-    _safe_emit(task_id, "completed", {"specialist": specialist, "latency_ms": latency_ms, "model": persona.default_model})
-    _safe_record_event({
-        "event_type": "dispatch_completed",
-        "task_id": task_id,
-        "specialist": specialist,
-        "model": persona.default_model,
-        "started_at": started_at,
-        "finished_at": finished_at,
-        "latency_ms": latency_ms,
-    })
-    _safe_unlink(processing_file)
+    _record_terminal(
+        results_dir=results_dir,
+        processing_file=processing_file,
+        task_id=task_id,
+        specialist=specialist,
+        status="completed",
+        started_at=started_at,
+        finished_at=finished_at,
+        latency_ms=latency_ms,
+        model=persona.default_model,
+        output=output,
+        emit_event="completed",
+        emit_payload={"specialist": specialist, "latency_ms": latency_ms, "model": persona.default_model},
+        record_event_type="dispatch_completed",
+    )
 
 
 def _write_status_atomic(results_dir: Path, task_id: str, payload: dict) -> None:
@@ -476,32 +502,23 @@ def reap_stale_processing(
         except (json.JSONDecodeError, FileNotFoundError, OSError):
             pass
         now_iso = datetime.now(timezone.utc).isoformat()
-        status_payload = {
-            "task_id": task_id,
-            "specialist": specialist,
-            "status": "abandoned",
-            "error": f"processing file older than {max_age_s}s without terminal result; consumer presumed crashed",
-            "started_at": now_iso,
-            "finished_at": now_iso,
-            "latency_ms": 0,
-            "model": None,
-            "tool_calls": 0,
-        }
         try:
-            _write_status_atomic(results_dir, task_id, status_payload)
+            _record_terminal(
+                results_dir=results_dir,
+                processing_file=f,
+                task_id=task_id,
+                specialist=specialist,
+                status="abandoned",
+                started_at=now_iso,
+                finished_at=now_iso,
+                error=f"processing file older than {max_age_s}s without terminal result; consumer presumed crashed",
+                emit_event="reaped",
+                emit_payload={"specialist": specialist, "age_s": int(age_s)},
+                record_event_type="dispatch_failed",
+            )
         except OSError as exc:
             print(f"[reaper] failed to write abandoned status for {task_id}: {exc}", file=sys.stderr)
             continue
-        _safe_emit(task_id, "reaped", {"specialist": specialist, "age_s": int(age_s)})
-        _safe_record_event({
-            "event_type": "dispatch_failed",
-            "task_id": task_id,
-            "specialist": specialist,
-            "error": status_payload["error"],
-            "started_at": now_iso,
-            "finished_at": now_iso,
-        })
-        _safe_unlink(f)
         reaped += 1
         print(f"[reaper] abandoned task={task_id} age={int(age_s)}s", file=sys.stderr, flush=True)
     return reaped
