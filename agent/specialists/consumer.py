@@ -380,8 +380,7 @@ def run_once(
             started_at=now,
             finished_at=now,
             error="task ttl_sec exceeded before invoke",
-            emit_event="expired",
-            record_event_type="dispatch_failed",
+            event_type="expired",
         )
         return
 
@@ -443,18 +442,15 @@ def run_once(
     )
     _record_terminal(
         results_dir=results_dir,
-        processing_file=processing_file,
+        processing_file=None,
         task_id=task_id,
         specialist=specialist,
         status="completed",
         started_at=started_at,
         finished_at=finished_at,
-        latency_ms=latency_ms,
         model=persona.default_model,
         output=output,
-        emit_event="completed",
-        emit_payload={"specialist": specialist, "latency_ms": latency_ms, "model": persona.default_model},
-        record_event_type="dispatch_completed",
+        event_type="completed",
     )
 
 
@@ -505,16 +501,14 @@ def reap_stale_processing(
         try:
             _record_terminal(
                 results_dir=results_dir,
-                processing_file=f,
+                processing_file=None,
                 task_id=task_id,
                 specialist=specialist,
                 status="abandoned",
                 started_at=now_iso,
                 finished_at=now_iso,
                 error=f"processing file older than {max_age_s}s without terminal result; consumer presumed crashed",
-                emit_event="reaped",
-                emit_payload={"specialist": specialist, "age_s": int(age_s)},
-                record_event_type="dispatch_failed",
+                event_type="reaped",
             )
         except OSError as exc:
             print(f"[reaper] failed to write abandoned status for {task_id}: {exc}", file=sys.stderr)
